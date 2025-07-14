@@ -1,0 +1,194 @@
+#include <Arduino_LSM9DS1.h>
+
+// Variables for sensor readings and filtering
+float pitch, roll, yaw;
+float filteredPitch = 0, filteredRoll = 0, filteredYaw = 0;
+float alpha = 0.1;
+int steps = 0;
+float accelThreshold = 1.9;
+bool stepDetected = false;
+float accelMagnitudePrev = 0;
+float baseYaw = 0;
+
+// Timing variables for non-blocking operation
+unsigned long lastPrintTime = 0;
+const unsigned long PRINT_INTERVAL = 10;  // 10ms between prints
+
+#define PULSE_SENSOR_PIN A0
+int heartRate = 0;
+int rawPulseValue = 0;
+bool isPulse = false;
+unsigned long lastBeatTime = 0;
+const int BEAT_THRESHOLD = 525;  // Adjust based on your sensor
+const unsigned long MIN_BEAT_INTERVAL = 300; // Minimum ms between beats (200BPM max)
+float filteredHeartRate = 0;
+const float hrAlpha = 0.1;  // Heart rate filter constant
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Validate pin is within range for this board
+  if (PULSE_SENSOR_PIN < A0 || PULSE_SENSOR_PIN > A7) while(1); // Halt if invalid pin
+  while (!Serial && millis() < 5000);
+  
+  if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU!");
+    while (1);
+  }
+  
+  Serial.println("IMU initialized. Calibrating...");
+  delay(1000);
+  calibrateSensor();
+
+  Serial.println("Place your finger on the pulse sensor");
+}
+
+void calibrateSensor() {
+  float mx, my, mz;
+  float ax, ay, az;
+  float sumYaw = 0;
+  int validReadings = 0;
+  
+  for(int i = 0; i < 10; i++) {
+    if (IMU.magneticFieldAvailable() && IMU.accelerationAvailable()) {
+      IMU.readMagneticField(mx, my, mz);
+      IMU.readAcceleration(ax, ay, az);
+      
+      // Calculate raw pitch and roll for tilt compensation
+      float p = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+      float r = -atan2(ay, az) * 180.0 / PI;  // Negated for consistent direction
+      
+      // Calculate tilt-compensated yaw
+      float mx_adj = mx * cos(p * PI/180) + my * sin(r * PI/180) * sin(p * PI/180) 
+                   + mz * cos(r * PI/180) * sin(p * PI/180);
+      float my_adj = my * cos(r * PI/180) - mz * sin(r * PI/180);
+      
+      float y = atan2(my_adj, mx_adj) * 180.0 / PI;
+      if (y < 0) y += 360;
+      
+      sumYaw += y;
+      validReadings++;
+    }
+    delay(50);
+  }
+  
+  if (validReadings > 0) {
+    baseYaw = sumYaw / validReadings;
+    Serial.print("Calibrated! Base yaw: ");
+    Serial.println(baseYaw);
+  }
+}
+
+void loop() {
+  // Check for calibration command
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'C') {
+      Serial.println("Recalibrating...");
+      calibrateSensor();
+      Serial.println("Calibration complete!");
+    }
+  }
+  
+  float ax, ay, az;
+  float gx, gy, gz;
+  float mx, my, mz;
+  
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable() && IMU.magneticFieldAvailable()) {
+    IMU.readAcceleration(ax, ay, az);
+    IMU.readGyroscope(gx, gy, gz);
+    IMU.readMagneticField(mx, my, mz);
+    
+    // Calculate pitch
+    pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+    
+    // Calculate roll (negative for consistent direction)
+    roll = -atan2(ay, az) * 180.0 / PI;
+    
+    // Calculate heading/yaw with tilt compensation
+    float mx_adj = mx * cos(pitch * PI/180) + my * sin(roll * PI/180) * sin(pitch * PI/180) 
+                  + mz * cos(roll * PI/180) * sin(pitch * PI/180);
+    float my_adj = my * cos(roll * PI/180) - mz * sin(roll * PI/180);
+    
+    yaw = atan2(my_adj, mx_adj) * 180.0 / PI;
+    if (yaw < 0) yaw += 360;
+    
+    // Apply filtering
+    filteredPitch = alpha * pitch + (1.0 - alpha) * filteredPitch;
+    filteredRoll = alpha * roll + (1.0 - alpha) * filteredRoll;
+    
+    // Handle yaw filtering with wraparound
+    float yawDiff = yaw - filteredYaw;
+    if (yawDiff > 180) yawDiff -= 360;
+    if (yawDiff < -180) yawDiff += 360;
+    filteredYaw = filteredYaw + alpha * yawDiff;
+    if (filteredYaw < 0) filteredYaw += 360;
+    if (filteredYaw >= 360) filteredYaw -= 360;
+    
+    // Calculate relative yaw from base (-180 to 180 range)
+    float relativeYaw = filteredYaw - baseYaw;
+    if (relativeYaw > 180) relativeYaw -= 360;
+    if (relativeYaw < -180) relativeYaw += 360;
+    
+    // Map to -90 to 90 range
+    if (relativeYaw > 90) relativeYaw = 180 - relativeYaw;
+    else if (relativeYaw < -90) relativeYaw = -180 - relativeYaw;
+    
+    // Step counter
+    float accelMagnitude = sqrt(ax*ax + ay*ay + az*az);
+    if (accelMagnitude > accelThreshold && accelMagnitudePrev <= accelThreshold && !stepDetected) {
+      steps++;
+      stepDetected = true;
+    } else if (accelMagnitude < accelThreshold - 0.4) {
+      stepDetected = false;
+    }
+    accelMagnitudePrev = accelMagnitude;
+    
+    // Read pulse data at same frequency as IMU
+    readHeartPulse();
+    
+    // Output values (non-blocking)
+    if (millis() - lastPrintTime >= PRINT_INTERVAL) {
+      Serial.print("P:");
+      Serial.print(filteredPitch, 2);
+      Serial.print(",R:");
+      Serial.print(filteredRoll, 2);
+      Serial.print(",Y:");
+      Serial.print(relativeYaw, 2);
+      Serial.print(",S:");
+      Serial.print(steps);
+      Serial.print(", BPM:");
+      Serial.println(filteredHeartRate, 0);
+      
+      lastPrintTime = millis();
+    }
+  }
+}
+void readHeartPulse() {
+  static bool wasAboveThreshold = false;
+  unsigned long currentTime = millis();
+  
+  // Read the raw value
+  rawPulseValue = analogRead(PULSE_SENSOR_PIN);
+  
+  // Detect rising edge crossing the threshold
+  bool isAboveThreshold = (rawPulseValue > BEAT_THRESHOLD);
+  
+  // Beat detection with debounce
+  if (isAboveThreshold && !wasAboveThreshold) {
+    // Check if enough time has passed since last beat
+    if ((currentTime - lastBeatTime) > MIN_BEAT_INTERVAL) {
+      // Calculate heart rate in BPM
+      if (lastBeatTime > 0) {
+        int newRate = 60000 / (currentTime - lastBeatTime);
+        
+        // Apply bounds checking for realistic values
+        if (newRate >= 40 && newRate <= 180) {
+          filteredHeartRate = hrAlpha * newRate + (1.0 - hrAlpha) * filteredHeartRate;
+        }
+      }
+      lastBeatTime = currentTime;
+    }
+  }
+  wasAboveThreshold = isAboveThreshold;
+}

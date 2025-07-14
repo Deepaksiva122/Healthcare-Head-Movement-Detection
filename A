@@ -1,0 +1,264 @@
+#include <ArduinoBLE.h>
+#include <Arduino_LSM9DS1.h>
+
+// BLE Service and Characteristics
+BLEService motionService("19B10010-E8F2-537E-4F6C-D104768A1214");
+BLEFloatCharacteristic pitchChar("19B10011-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEFloatCharacteristic rollChar("19B10012-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEFloatCharacteristic yawChar("19B10013-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEIntCharacteristic stepsChar("19B10014-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEIntCharacteristic bpmChar("19B10015-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+
+// Variables for sensor readings and filtering
+float pitch, roll, yaw;
+float filteredPitch = 0, filteredRoll = 0, filteredYaw = 0;
+const float alpha = 0.1;
+int steps = 0;
+const float accelThreshold = 1.9;
+bool stepDetected = false;
+float accelMagnitudePrev = 0;
+float baseYaw = 0;
+
+// Power-saving
+constexpr int PULSE_SENSOR_PIN = A0;
+constexpr unsigned long UPDATE_INTERVAL = 100;     // Sensor read interval (ms)
+constexpr unsigned long BLE_INTERVAL = 500;        // BLE update interval (ms)
+unsigned long lastUpdateTime = 0;
+unsigned long lastBleTime = 0;
+bool bleConnected = false;
+
+// Heart rate variables
+int heartRate = 0;
+bool isPulse = false;
+unsigned long lastBeatTime = 0;
+constexpr int BEAT_THRESHOLD = 525;
+constexpr unsigned long MIN_BEAT_INTERVAL = 300;
+float filteredHeartRate = 0;
+constexpr float hrAlpha = 0.1;
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize BLE
+  if (!BLE.begin()) {
+    Serial.println("BLE failed!");
+    while (1);
+  }
+  
+  // Initialize IMU with lower data rate for power savings
+  if (!IMU.begin()) {
+    Serial.println("IMU failed!");
+    while (1);
+  }
+  
+  // Set up BLE services and characteristics
+  BLE.setLocalName("MotionTracker");
+  BLE.setAdvertisedService(motionService);
+  
+  motionService.addCharacteristic(pitchChar);
+  motionService.addCharacteristic(rollChar);
+  motionService.addCharacteristic(yawChar);
+  motionService.addCharacteristic(stepsChar);
+  motionService.addCharacteristic(bpmChar);
+  
+  BLE.addService(motionService);
+  BLE.advertise();
+  
+  Serial.println("Bluetooth device active, waiting for connections...");
+  
+  // Calibrate
+  calibrateSensor();
+  IMU.setContinuousMode(); // 10Hz saves power
+}
+
+void loop() {
+  // Update BLE central connections
+  BLEDevice central = BLE.central();
+  
+  // Connection management for power saving
+  if (central && !bleConnected) {
+    bleConnected = true;
+    Serial.print("Connected to central: ");
+    Serial.println(central.address());
+  } else if (!central && bleConnected) {
+    bleConnected = false;
+    Serial.println("Disconnected from central");
+  }
+  
+  // Check if it's time to update sensors (reduced sampling rate)
+  if (millis() - lastUpdateTime >= UPDATE_INTERVAL) {
+    lastUpdateTime = millis();
+    
+    if (readSensors()) {
+      // Only send data if connected and interval elapsed
+      if (bleConnected && (millis() - lastBleTime >= BLE_INTERVAL)) {
+        updateBLEData();
+        lastBleTime = millis();
+      }
+    }
+  }
+  
+  // Keep BLE stack running
+  BLE.poll();
+}
+
+bool readSensors() {
+  float ax, ay, az;
+  float mx, my, mz;
+  
+  if (IMU.accelerationAvailable() && IMU.magneticFieldAvailable()) {
+    IMU.readAcceleration(ax, ay, az);
+    IMU.readMagneticField(mx, my, mz);
+    
+    // Calculate pitch and roll
+    pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+    roll = -atan2(ay, az) * 180.0 / PI;
+    
+    // Calculate heading/yaw with tilt compensation
+    float mx_adj = mx * cos(pitch * PI/180) + my * sin(roll * PI/180) * sin(pitch * PI/180) 
+                  + mz * cos(roll * PI/180) * sin(pitch * PI/180);
+    float my_adj = my * cos(roll * PI/180) - mz * sin(roll * PI/180);
+    
+    yaw = atan2(my_adj, mx_adj) * 180.0 / PI;
+    if (yaw < 0) yaw += 360;
+    
+    // Apply filtering
+    filteredPitch = alpha * pitch + (1.0 - alpha) * filteredPitch;
+    filteredRoll = alpha * roll + (1.0 - alpha) * filteredRoll;
+    
+    // Handle yaw filtering with wraparound
+    float yawDiff = yaw - filteredYaw;
+    if (yawDiff > 180) yawDiff -= 360;
+    if (yawDiff < -180) yawDiff += 360;
+    filteredYaw = filteredYaw + alpha * yawDiff;
+    if (filteredYaw < 0) filteredYaw += 360;
+    if (filteredYaw >= 360) filteredYaw -= 360;
+    
+    // Calculate relative yaw 
+    float relativeYaw = filteredYaw - baseYaw;
+    if (relativeYaw > 180) relativeYaw -= 360;
+    if (relativeYaw < -180) relativeYaw += 360;
+    
+    // Map to -90 to 90 range
+    if (relativeYaw > 90) relativeYaw = 180 - relativeYaw;
+    else if (relativeYaw < -90) relativeYaw = -180 - relativeYaw;
+    
+    // Step counter
+    
+float accelMagnitude = sqrt(ax*ax + ay*ay + az*az);
+static unsigned long lastStepTime = 0;
+const unsigned long STEP_COOLDOWN = 300; // ms between steps
+
+if (accelMagnitude > accelThreshold && 
+    accelMagnitudePrev <= accelThreshold && 
+    !stepDetected && 
+    (millis() - lastStepTime > STEP_COOLDOWN)) {
+  steps++;
+  stepDetected = true;
+  lastStepTime = millis();
+} else if (accelMagnitude < accelThreshold - 0.4) {
+      stepDetected = false;
+    }
+    accelMagnitudePrev = accelMagnitude;
+    
+    // Read heart rate (only if BLE connected to save power)
+    if (bleConnected) {
+      readHeartPulse();
+    }
+    
+    return true;
+  }
+  return false;
+}
+
+void updateBLEData() {
+  pitchChar.writeValue(filteredPitch);
+  rollChar.writeValue(filteredRoll);
+  yawChar.writeValue(filteredYaw);
+  stepsChar.writeValue(steps);
+  bpmChar.writeValue((int)filteredHeartRate);
+  
+  // Debug info
+  if (Serial) {
+    Serial.print("Pitch: ");
+    Serial.print(filteredPitch);
+    Serial.print(" Roll: ");
+    Serial.print(filteredRoll);
+    Serial.print(" Yaw: ");
+    Serial.print(filteredYaw);
+    Serial.print(" Steps: ");
+    Serial.print(steps);
+    Serial.print(" BPM: ");
+    Serial.println((int)filteredHeartRate);
+  }
+}
+
+void readHeartPulse() {
+  int sensorValue = analogRead(PULSE_SENSOR_PIN);
+  
+  // Detect pulse
+  if (sensorValue > BEAT_THRESHOLD && !isPulse) {
+    unsigned long currentTime = millis();
+    
+    // Check if enough time has passed since last beat
+    if (currentTime - lastBeatTime > MIN_BEAT_INTERVAL) {
+      // Calculate BPM
+      unsigned long timeBetweenBeats = currentTime - lastBeatTime;
+      heartRate = 60000 / timeBetweenBeats; // Convert to BPM
+      
+      // Apply filtering to heart rate
+      if (heartRate > 40 && heartRate < 200) { // Reasonable range
+        filteredHeartRate = hrAlpha * heartRate + (1.0 - hrAlpha) * filteredHeartRate;
+      }
+      
+      lastBeatTime = currentTime;
+    }
+    
+    isPulse = true;
+  } else if (sensorValue < BEAT_THRESHOLD) {
+    isPulse = false;
+  }
+}
+
+void calibrateSensor() {
+  Serial.println("Calibrating... Keep device still for 3 seconds");
+  
+  float totalYaw = 0;
+  int samples = 0;
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < 3000) { // 3 second calibration
+    float ax, ay, az, mx, my, mz;
+    
+    if (IMU.accelerationAvailable() && IMU.magneticFieldAvailable()) {
+      IMU.readAcceleration(ax, ay, az);
+      IMU.readMagneticField(mx, my, mz);
+      
+      // Calculate pitch and roll for calibration
+      float calPitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+      float calRoll = -atan2(ay, az) * 180.0 / PI;
+      
+      // Calculate yaw with tilt compensation
+      float mx_adj = mx * cos(calPitch * PI/180) + my * sin(calRoll * PI/180) * sin(calPitch * PI/180) 
+                    + mz * cos(calRoll * PI/180) * sin(calPitch * PI/180);
+      float my_adj = my * cos(calRoll * PI/180) - mz * sin(calRoll * PI/180);
+      
+      float calYaw = atan2(my_adj, mx_adj) * 180.0 / PI;
+      if (calYaw < 0) calYaw += 360;
+      
+      totalYaw += calYaw;
+      samples++;
+    }
+    
+    delay(10);
+  }
+  
+  if (samples > 0) {
+    baseYaw = totalYaw / samples;
+    Serial.print("Calibration complete. Base yaw: ");
+    Serial.println(baseYaw);
+  } else {
+    Serial.println("Calibration failed - using default");
+    baseYaw = 0;
+  }
+}

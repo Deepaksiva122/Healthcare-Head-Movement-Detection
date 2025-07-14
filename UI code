@@ -1,0 +1,923 @@
+import processing.serial.*;
+
+boolean isLogging = false;
+PrintWriter csvWriter;
+String csvFileName = "sensor_log.csv";
+boolean hasWrittenHeader = false;
+
+Serial myPort;
+String input;
+float pitch = 0, roll = 0, yaw = 0;
+int steps = 0;
+String connectionStatus = "Disconnected";
+boolean isConnected = false;
+
+// UI Elements
+color backgroundColor = color(45, 45, 55);
+color textColor = color(255, 255, 255);
+color accentColor = color(100, 150, 255);
+PFont titleFont, dataFont;
+
+// Live Graph Data
+ArrayList<Float> pitchHistory;
+ArrayList<Float> rollHistory;
+ArrayList<Float> yawHistory;
+int maxDataPoints = 200;
+float graphWidth = 350;
+float graphHeight = 150;
+
+// Pulse Rate
+int bpm = 0;
+ArrayList<Integer> bpmHistory = new ArrayList<Integer>();
+int maxBPMPoints = 200;
+
+float pulseSize = 30;
+boolean pulseGrow = true;
+
+ResponsiveButton startButton, stopButton, downloadButton, calibrateButton;
+
+class ResponsiveButton {
+  float x, y, w, h;
+  String label;
+  color normalColor, hoverColor, pressedColor, disabledColor;
+  color currentColor;
+  boolean isHovered = false;
+  boolean isPressed = false;
+  boolean isEnabled = true;
+  boolean wasClicked = false;
+  int cornerRadius = 8;
+  
+  ResponsiveButton(float x, float y, float w, float h, String label) {
+    this.x = x;
+    this.y = y;
+    this.w = w;
+    this.h = h;
+    this.label = label;
+    
+    // Define button colors
+    this.normalColor = color(70, 130, 200);
+    this.hoverColor = color(90, 150, 220);
+    this.pressedColor = color(50, 110, 180);
+    this.disabledColor = color(100, 100, 100);
+    this.currentColor = normalColor;
+  }
+  
+  void update() {
+    if (!isEnabled) {
+      currentColor = disabledColor;
+      return;
+    }
+    
+    // Check if mouse is over button
+    isHovered = (mouseX >= x && mouseX <= x + w && 
+                 mouseY >= y && mouseY <= y + h);
+    
+    // Update color based on state
+    if (isPressed) {
+      currentColor = lerpColor(currentColor, pressedColor, 0.3);
+    } else if (isHovered) {
+      currentColor = lerpColor(currentColor, hoverColor, 0.2);
+    } else {
+      currentColor = lerpColor(currentColor, normalColor, 0.1);
+    }
+  }
+  
+  void draw() {
+    // Draw button shadow
+    fill(0, 0, 0, 50);
+    noStroke();
+    rect(x + 2, y + 2, w, h, cornerRadius);
+    
+    // Draw button background
+    fill(currentColor);
+    stroke(255, 255, 255, 100);
+    strokeWeight(1);
+    rect(x, y, w, h, cornerRadius);
+    
+    // Draw button highlight
+    if (isHovered && isEnabled) {
+      fill(255, 255, 255, 30);
+      noStroke();
+      rect(x + 1, y + 1, w - 2, h/2, cornerRadius);
+    }
+    
+    // Draw button text
+    fill(isEnabled ? color(255, 255, 255) : color(180, 180, 180));
+    textAlign(CENTER, CENTER);
+    textFont(dataFont);
+    text(label, x + w/2, y + h/2);
+    
+    // Draw press animation
+    if (isPressed && isEnabled) {
+      fill(255, 255, 255, 100);
+      noStroke();
+      ellipse(mouseX, mouseY, 30, 30);
+    }
+  }
+  
+  boolean isClicked() {
+    if (wasClicked) {
+      wasClicked = false;
+      return true;
+    }
+    return false;
+  }
+  
+  void setEnabled(boolean enabled) {
+    this.isEnabled = enabled;
+  }
+}
+
+void setup() {
+  size(1200, 700, P3D);
+
+  // Initialize fonts
+  titleFont = createFont("Arial", 24, true);
+  dataFont = createFont("Arial", 16, true);
+
+  setupResponsiveButtons();
+
+  // Initialize graph data arrays
+  pitchHistory = new ArrayList<Float>();
+  rollHistory = new ArrayList<Float>();
+  yawHistory = new ArrayList<Float>();
+
+  println("Available Serial Ports:");
+  String[] ports = Serial.list();
+  for (int i = 0; i < ports.length; i++) {
+    println(i + ": " + ports[i]);
+  }
+
+  // Try to connect to serial port
+  try {
+    if (ports.length > 0) {
+      myPort = new Serial(this, ports[ports.length - 1], 9600);  // Use last port
+      myPort.bufferUntil('\n');
+      connectionStatus = "Connected to: " + ports[ports.length - 1];
+      isConnected = true;
+    } else {
+      connectionStatus = "No serial ports available";
+    }
+  } catch (Exception e) {
+    connectionStatus = "Connection failed: " + e.getMessage();
+    isConnected = false;
+  }
+}
+
+void setupResponsiveButtons() {
+  startButton = new ResponsiveButton(350, 520, 100, 40, "START");
+  stopButton = new ResponsiveButton(350, 570, 100, 40, "STOP");
+  downloadButton = new ResponsiveButton(350, 630, 150, 40, "DOWNLOAD CSV");
+  calibrateButton = new ResponsiveButton(20, 620, 250, 40, "CALIBRATE");
+  
+  // Initially disable stop button
+  stopButton.setEnabled(false);
+}
+
+void draw() {
+  background(backgroundColor);
+  
+  // Draw UI panels
+  drawUIPanel();
+  
+  // Draw 3D head in center
+  draw3DHead();
+  
+  // Draw angle indicators
+  drawAngleIndicators();
+  
+  // Draw live graph
+  drawLiveGraph();
+  
+  // Draw connection status
+  drawConnectionStatus();
+  
+  // Draw pulse in a speedometer
+  drawPulseMonitor();
+  
+  // Draw BPM live graph
+  drawBPMGraph();
+  
+  // Handle button interactions
+  handleButtonClicks();
+}
+
+void drawUIPanel() {
+  // Left panel background
+  fill(35, 35, 45, 200);
+  noStroke();
+  rect(0, 0, 300, height);
+  
+  // Title
+  fill(accentColor);
+  textFont(titleFont);
+  textAlign(LEFT);
+  text("Head Tracking Monitor", 20, 40);
+  
+  // Angle readings with visual bars
+  textFont(dataFont);
+  fill(textColor);
+  
+  // Pitch display
+  text("PITCH (Up/Down)", 20, 80);
+  fill(255, 100, 100);
+  text(nf(pitch, 1, 2) + "°", 20, 105);
+  drawAngleBar(20, 115, 250, 15, pitch, -90, 90, color(255, 100, 100));
+  
+  // Roll display
+  fill(textColor);
+  text("ROLL (Left/Right)", 20, 160);
+  fill(100, 255, 100);
+  text(nf(roll, 1, 2) + "°", 20, 185);
+  drawAngleBar(20, 195, 250, 15, roll, -90, 90, color(100, 255, 100));
+  
+  // Yaw display
+  fill(textColor);
+  text("YAW (Turn)", 20, 240);
+  fill(100, 100, 255);
+  text(nf(yaw, 1, 2) + "°", 20, 265);
+  drawAngleBar(20, 275, 250, 15, yaw, -180, 180, color(100, 100, 255));
+  
+  // Steps counter
+  fill(textColor);
+  text("STEPS COUNT", 20, 320);
+  fill(accentColor);
+  text(str(steps), 20, 345);
+  
+  // Instructions
+  fill(textColor);
+  text("Instructions:", 20, 400);
+  text("• Move your head to see rotation", 20, 425);
+  text("• Pitch: Nod up/down", 20, 445);
+  text("• Roll: Tilt left/right", 20, 465);
+  text("• Real-time angle feedback", 20, 485);
+  text("• Live graph shows movement", 20, 505);
+  
+  // Controls
+  text("Controls:", 20, 540);
+  text("• Press 'R' to reset angles", 20, 560);
+  text("• Press 'D' for demo mode", 20, 580);
+  text("• Press 'C' to clear graph", 20, 600);
+  
+  // Update and draw responsive buttons
+  startButton.update();
+  stopButton.update();
+  downloadButton.update();
+  calibrateButton.update();
+  
+  startButton.draw();
+  stopButton.draw();
+  downloadButton.draw();
+  calibrateButton.draw();
+}
+
+void drawAngleBar(float x, float y, float w, float h, float value, float minVal, float maxVal, color barColor) {
+  // Background bar
+  fill(60, 60, 70);
+  rect(x, y, w, h);
+  
+  // Value bar
+  float normalizedValue = map(abs(value), 0, max(abs(minVal), abs(maxVal)), 0, w/2);
+  fill(barColor);
+  
+  if (value >= 0) {
+    rect(x + w/2, y, normalizedValue, h);
+  } else {
+    rect(x + w/2 - normalizedValue, y, normalizedValue, h);
+  }
+  
+  // Center line
+  stroke(255);
+  strokeWeight(1);
+  line(x + w/2, y, x + w/2, y + h);
+  noStroke();
+}
+
+void draw3DHead() {
+  // Setup 3D viewport
+  pushMatrix();
+  translate(width * 0.65, height * 0.5, 0);
+  
+  // Apply rotations based on sensor data
+  rotateX(radians(pitch));   // Pitch (nod up/down)
+  rotateZ(radians(roll));    // Roll (tilt left/right)
+  rotateY(radians(yaw));     // Yaw (turn left/right)
+  
+  // Enable lighting for 3D effect
+  lights();
+  ambientLight(60, 60, 60);
+  directionalLight(255, 255, 255, -1, 0.5, -1);
+  
+  drawRealisticHead();
+  
+  popMatrix();
+}
+
+void drawRealisticHead() {
+  // Head (main ellipsoid)
+  fill(255, 220, 177); // Skin color
+  stroke(200, 180, 150);
+  strokeWeight(1);
+  
+  pushMatrix();
+  scale(1.2, 1.4, 1.0);
+  sphere(80);
+  popMatrix();
+  
+  // Eyes
+  fill(255, 255, 255);
+  noStroke();
+  
+  // Left eye
+  pushMatrix();
+  translate(-30, -25, 65);
+  ellipse(0, 0, 20, 15);
+  // Pupil
+  fill(50, 50, 50);
+  ellipse(0, 0, 8, 8);
+  // Iris
+  fill(100, 150, 200);
+  ellipse(0, 0, 12, 12);
+  // Pupil
+  fill(20, 20, 20);
+  ellipse(0, 0, 6, 6);
+  popMatrix();
+  
+  // Right eye
+  pushMatrix();
+  translate(30, -25, 65);
+  fill(255, 255, 255);
+  ellipse(0, 0, 20, 15);
+  // Pupil
+  fill(50, 50, 50);
+  ellipse(0, 0, 8, 8);
+  // Iris
+  fill(100, 150, 200);
+  ellipse(0, 0, 12, 12);
+  // Pupil
+  fill(20, 20, 20);
+  ellipse(0, 0, 6, 6);
+  popMatrix();
+  
+  // Rectangular Spectacles - Enhanced visibility
+  stroke(20, 20, 20);  // Darker frame color
+  strokeWeight(4);     // Thicker frame
+  fill(240, 240, 255, 100);  // Semi-transparent lens tint
+  
+  // Left lens frame
+  pushMatrix();
+  translate(-30, -25, 72);  // Moved slightly forward
+  rect(-18, -12, 36, 24, 2);  // Larger rectangular frame
+  popMatrix();
+  
+  // Right lens frame
+  pushMatrix();
+  translate(30, -25, 72);   // Moved slightly forward
+  rect(-18, -12, 36, 24, 2);  // Larger rectangular frame
+  popMatrix();
+  
+  // Bridge - thicker and more visible
+  stroke(20, 20, 20);
+  strokeWeight(4);
+  pushMatrix();
+  translate(0, -25, 72);
+  line(-12, 0, 12, 0);  // Bridge connection
+  // Add bridge support
+  noFill();
+  arc(0, 0, 24, 8, 0, PI);  // Curved bridge detail
+  popMatrix();
+  
+  // Temple arms - more prominent
+  strokeWeight(3);
+  pushMatrix();
+  translate(-48, -25, 72);
+  line(0, 0, -30, 5);    // Temple extending back
+  line(-30, 5, -35, 20); // Temple curve over ear
+  popMatrix();
+  
+  pushMatrix();
+  translate(48, -25, 72);
+  line(0, 0, 30, 5);     // Temple extending back
+  line(30, 5, 35, 20);   // Temple curve over ear
+  popMatrix();
+  
+  // Add frame details for realism
+  stroke(40, 40, 40);
+  strokeWeight(1);
+  // Left frame inner detail
+  pushMatrix();
+  translate(-30, -25, 73);
+  noFill();
+  rect(-16, -10, 32, 20, 2);
+  popMatrix();
+  
+  // Right frame inner detail
+  pushMatrix();
+  translate(30, -25, 73);
+  noFill();
+  rect(-16, -10, 32, 20, 2);
+  popMatrix();
+  
+  // Nose
+  fill(255, 210, 160);
+  noStroke();
+  pushMatrix();
+  translate(0, -5, 75);
+  box(8, 20, 12);
+  popMatrix();
+  
+  // Nostrils
+  fill(200, 180, 140);
+  pushMatrix();
+  translate(-4, 5, 80);
+  ellipse(0, 0, 3, 6);
+  translate(8, 0, 0);
+  ellipse(0, 0, 3, 6);
+  popMatrix();
+  
+  // Mouth
+  fill(200, 100, 100);
+  noStroke();
+  pushMatrix();
+  translate(0, 25, 65);
+  ellipse(0, 0, 30, 8);
+  popMatrix();
+  
+  // Eyebrows
+  fill(101, 67, 33);
+  pushMatrix();
+  translate(-30, -40, 68);
+  ellipse(0, 0, 25, 5);
+  translate(60, 0, 0);
+  ellipse(0, 0, 25, 5);
+  popMatrix();
+}
+
+void drawAngleIndicators() {
+  // --- PITCH INDICATOR (right side) ---
+  pushMatrix();
+  translate(width - 100, height / 2);
+  
+  // Pitch arc
+  stroke(255, 100, 100);
+  strokeWeight(2);
+  noFill();
+  arc(0, 0, 150, 150, radians(-90), radians(90));
+  
+  // Pitch needle
+  stroke(255, 150, 150);
+  strokeWeight(3);
+  float pitchAngle = radians(pitch);
+  line(0, 0, 60 * cos(pitchAngle - PI/2), 60 * sin(pitchAngle - PI/2));
+  
+  // Labels
+  fill(255, 100, 100);
+  textAlign(CENTER);
+  text("PITCH", 0, 90);
+  popMatrix();
+  
+  // --- ROLL INDICATOR (bottom center-right) ---
+  pushMatrix();
+  translate(width * 0.65, height - 100);
+  
+  // Roll arc
+  stroke(100, 255, 100);
+  strokeWeight(2);
+  noFill();
+  arc(0, 0, 150, 150, radians(0), radians(180));
+  
+  // Roll needle
+  stroke(150, 255, 150);
+  strokeWeight(3);
+  float rollAngle = radians(roll);
+  line(0, 0, 60 * cos(rollAngle), 60 * sin(rollAngle));
+  
+  // Labels
+  fill(100, 255, 100);
+  textAlign(CENTER);
+  text("ROLL", 0, 90);
+  popMatrix();
+  
+  // --- YAW INDICATOR (left side) ---
+  pushMatrix();
+  translate(400, height / 2);
+  
+  // Yaw arc (full 360)
+  stroke(100, 100, 255);
+  strokeWeight(2);
+  noFill();
+  arc(0, 0, 150, 150, radians(-180), radians(180));
+  
+  // Yaw needle
+  stroke(150, 150, 255);
+  strokeWeight(3);
+  float yawAngle = radians(yaw);
+  line(0, 0, 60 * cos(yawAngle - PI/2), 60 * sin(yawAngle - PI/2));
+  
+  // Labels
+  fill(100, 100, 255);
+  textAlign(CENTER);
+  text("YAW", 0, 90);
+  popMatrix();
+}
+
+void drawConnectionStatus() {
+  // Connection status at bottom
+  fill(isConnected ? color(100, 255, 100) : color(255, 100, 100));
+  textAlign(LEFT);
+  textFont(dataFont);
+  text(connectionStatus, 20, height - 20);
+}
+
+void drawLiveGraph() {
+  // Graph background
+  float graphX = width - graphWidth - 20;
+  float graphY = 50;
+  
+  fill(25, 25, 35, 200);
+  stroke(100, 100, 120);
+  strokeWeight(1);
+  rect(graphX, graphY, graphWidth, graphHeight);
+  
+  // Graph title
+  fill(textColor);
+  textFont(dataFont);
+  textAlign(CENTER);
+  text("Head Movement Graph", graphX + graphWidth/2, graphY - 10);
+  
+  // Draw grid lines
+  stroke(60, 60, 70);
+  strokeWeight(1);
+  
+  // Horizontal grid lines
+  for (int i = 0; i <= 4; i++) {
+    float y = graphY + (graphHeight * i / 4);
+    line(graphX, y, graphX + graphWidth, y);
+  }
+  
+  // Vertical grid lines (time markers)
+  for (int i = 0; i <= 5; i++) {
+    float x = graphX + (graphWidth * i / 5);
+    line(x, graphY, x, graphY + graphHeight);
+  }
+  
+  // Draw angle labels
+  textAlign(RIGHT);
+  fill(150, 150, 150);
+  textSize(10);
+  text("90°", graphX - 5, graphY + 5);
+  text("45°", graphX - 5, graphY + graphHeight/4 + 5);
+  text("0°", graphX - 5, graphY + graphHeight/2 + 5);
+  text("-45°", graphX - 5, graphY + 3*graphHeight/4 + 5);
+  text("-90°", graphX - 5, graphY + graphHeight + 5);
+  
+  // Draw data lines
+  if (pitchHistory.size() > 1) {
+    drawGraphLine(pitchHistory, graphX, graphY, graphWidth, graphHeight, color(255, 100, 100), "PITCH");
+  }
+  
+  if (rollHistory.size() > 1) {
+    drawGraphLine(rollHistory, graphX, graphY, graphWidth, graphHeight, color(100, 255, 100), "ROLL");
+  }
+  
+  if (yawHistory.size() > 1) {
+    drawGraphLine(yawHistory, graphX, graphY, graphWidth, graphHeight, color(100, 100, 255), "YAW");
+  }
+  
+  // Draw legend
+  textAlign(LEFT);
+  textSize(12);
+  fill(255, 100, 100);
+  text("■ PITCH", graphX + 10, graphY + graphHeight + 20);
+  fill(100, 255, 100);
+  text("■ ROLL", graphX + 80, graphY + graphHeight + 20);
+  fill(100, 100, 255);
+  text("■ YAW", graphX + 140, graphY + graphHeight + 20);
+  
+  // Current values indicator
+  fill(255, 255, 255);
+  textAlign(RIGHT);
+  textSize(10);
+  text("Current: P:" + nf(pitch, 1, 1) + "° R:" + nf(roll, 1, 1) + "° Y:" + nf(yaw, 1, 1) + "°", 
+       graphX + graphWidth - 5, graphY + graphHeight + 35);
+}
+
+void drawGraphLine(ArrayList<Float> data, float graphX, float graphY, float gWidth, float gHeight, color lineColor, String label) {
+  stroke(lineColor);
+  strokeWeight(2);
+  noFill();
+  
+  beginShape();
+  for (int i = 0; i < data.size(); i++) {
+    float x = map(i, 0, maxDataPoints - 1, graphX, graphX + gWidth);
+    float y = map(data.get(i), -90, 90, graphY + gHeight, graphY);
+    
+    // Constrain y to graph bounds
+    y = constrain(y, graphY, graphY + gHeight);
+    
+    vertex(x, y);
+  }
+  endShape();
+  
+  // Draw current value point
+  if (data.size() > 0) {
+    fill(lineColor);
+    noStroke();
+    float lastX = map(data.size() - 1, 0, maxDataPoints - 1, graphX, graphX + gWidth);
+    float lastY = map(data.get(data.size() - 1), -90, 90, graphY + gHeight, graphY);
+    lastY = constrain(lastY, graphY, graphY + gHeight);
+    ellipse(lastX, lastY, 6, 6);
+  }
+}
+
+void updateGraphData() {
+  // Add current values to history
+  pitchHistory.add(pitch);
+  rollHistory.add(roll);
+  yawHistory.add(yaw);
+  
+  // Remove old data points to maintain maxDataPoints
+  if (pitchHistory.size() > maxDataPoints) {
+    pitchHistory.remove(0);
+  }
+  if (rollHistory.size() > maxDataPoints) {
+    rollHistory.remove(0);
+  }
+  if (yawHistory.size() > maxDataPoints) {
+    yawHistory.remove(0);
+  }
+}
+
+void serialEvent(Serial p) {
+  String input = p.readStringUntil('\n');
+  
+  if (input != null) {
+    input = trim(input);
+
+    try {
+      // Parse combined line: P:-2.15,R:1.44,Y:-9.48,S:0, BPM:75
+      if (input.startsWith("P:")) {
+        String[] parts = splitTokens(input, ",: ");
+        if (parts.length >= 10) {
+          pitch = float(parts[1]);
+          roll = float(parts[3]);
+          yaw = float(parts[5]);
+          steps = int(parts[7]);
+          bpm = int(parts[9]);
+          bpmHistory.add(bpm);
+          if (bpmHistory.size() > maxBPMPoints) {
+            bpmHistory.remove(0);
+          }
+        }
+      } 
+      // Support BPM-only line: BPM:75
+      else if (input.startsWith("BPM:")) {
+        bpm = int(trim(input.substring(4)));
+        bpmHistory.add(bpm);
+        if (bpmHistory.size() > maxBPMPoints) {
+          bpmHistory.remove(0);
+        }
+      }
+      // Support alternate IMU format: PITCH:xx.xx,ROLL:yy.yy,YAW:zz.zz,STEPS:nnn
+      else if (input.startsWith("PITCH:")) {
+        String[] parts = splitTokens(input, ",: ");
+        if (parts.length >= 8) {
+          pitch = float(parts[1]);
+          roll = float(parts[3]);
+          yaw = float(parts[5]);
+          steps = int(parts[7]);
+        }
+      }
+
+      // Constrain angles
+      pitch = constrain(pitch, -90, 90);
+      roll = constrain(roll, -90, 90);
+      yaw = constrain(yaw, -180, 180);
+
+      // Update visuals
+      updateGraphData();
+
+    } catch (Exception e) {
+      println("Invalid input: " + input);
+    }
+  }
+  
+  // Log data if logging is enabled
+  if (isLogging && csvWriter != null) {
+    if (!hasWrittenHeader) {
+      csvWriter.println("Time(ms),Pitch,Roll,Yaw,Steps,BPM");
+      hasWrittenHeader = true;
+    }
+    csvWriter.println(millis() + "," + pitch + "," + roll + "," + yaw + "," + steps + "," + bpm);
+  }
+}
+
+void drawPulseMonitor() {
+  float x = width - 100;
+  float y = height - 150;
+
+  // Pulse animation
+  noStroke();
+  fill(255, 0, 100, 150);
+  ellipse(x, y, pulseSize, pulseSize);
+
+  // Animate pulse
+  if (pulseGrow) {
+    pulseSize += 0.5;
+    if (pulseSize >= 40) pulseGrow = false;
+  } else {
+    pulseSize -= 0.5;
+    if (pulseSize <= 30) pulseGrow = true;
+  }
+
+  // BPM Text
+  fill(255);
+  textAlign(CENTER);
+  textFont(titleFont);
+  text("BPM", x, y - 60);
+  textFont(dataFont);
+  text(str(bpm), x, y - 30);
+}
+
+void drawBPMGraph() {
+  float graphX = 320;
+  float graphY = 50;
+  float gHeight = 120;
+
+  fill(25, 25, 35, 200);
+  stroke(100);
+  rect(graphX, graphY, graphWidth, gHeight);
+
+  textAlign(CENTER);
+  fill(255);
+  text("Pulse Rate Graph", graphX + graphWidth/2, graphY - 10);
+
+  if (bpmHistory.size() > 1) {
+    stroke(255, 0, 100);
+    strokeWeight(2);
+    noFill();
+    beginShape();
+    for (int i = 0; i < bpmHistory.size(); i++) {
+      float x = map(i, 0, maxBPMPoints - 1, graphX, graphX + graphWidth);
+      float y = map(bpmHistory.get(i), 40, 160, graphY + gHeight, graphY); // Assuming BPM range 40–160
+      vertex(x, y);
+    }
+    endShape();
+  }
+
+  // Current BPM Label
+  fill(255);
+  textAlign(RIGHT);
+  textSize(10);
+  text("Current BPM: " + bpm, graphX + graphWidth - 5, graphY + gHeight + 15);
+}
+
+void handleButtonClicks() {
+  if (startButton.isClicked()) {
+    startLogging();
+    startButton.setEnabled(false);
+    stopButton.setEnabled(true);
+  }
+  
+  if (stopButton.isClicked()) {
+    stopLogging();
+    startButton.setEnabled(true);
+    stopButton.setEnabled(false);
+  }
+  
+  if (downloadButton.isClicked()) {
+    saveCSV();
+  }
+  
+  if (calibrateButton.isClicked()) {
+    calibrateSystem();
+  }
+}
+
+void keyPressed() {
+  // Demo mode for testing without hardware
+  if (key == 'r' || key == 'R') {
+    // Reset angles
+    pitch = 0;
+    roll = 0;
+    yaw = 0;
+    updateGraphData();
+  } else if (key == 'd' || key == 'D') {
+    // Demo mode - simulate random movements
+    pitch = random(-45, 45);
+    roll = random(-45, 45);
+    yaw = random(-30, 30);
+    bpm = int(random(60, 120));
+    steps = int(random(0, 10000));
+    updateGraphData();
+  } else if (key == 'c' || key == 'C') {
+    // Clear graph history
+    pitchHistory.clear();
+    rollHistory.clear();
+    yawHistory.clear();
+    bpmHistory.clear();
+  }
+}
+
+void startLogging() {
+  if (!isLogging) {
+    isLogging = true;
+    csvWriter = createWriter(csvFileName);
+    hasWrittenHeader = false;
+    println("Logging started.");
+  }
+}
+
+void stopLogging() {
+  if (isLogging) {
+    isLogging = false;
+    if (csvWriter != null) {
+      csvWriter.flush();
+      csvWriter.close();
+      csvWriter = null;
+    }
+    println("Logging stopped.");
+  }
+}
+
+void saveCSV() {
+  if (csvWriter != null) {
+    csvWriter.flush();
+    csvWriter.close();
+    csvWriter = null;
+  }
+  println("CSV file saved: " + csvFileName);
+}
+
+void calibrateSystem() {
+  // Reset all values to zero for calibration
+  pitch = 0;
+  roll = 0;
+  yaw = 0;
+  steps = 0;
+  bpm = 0;
+  
+  // Clear history arrays
+  pitchHistory.clear();
+  rollHistory.clear();
+  yawHistory.clear();
+  bpmHistory.clear();
+  
+  // Send calibration command to Arduino if connected
+  if (isConnected && myPort != null) {
+    try {
+      myPort.write("CALIBRATE\n");
+      println("Calibration command sent to device");
+    } catch (Exception e) {
+      println("Error sending calibration command: " + e.getMessage());
+    }
+  }
+  
+  println("System calibrated - all values reset to zero");
+}
+
+void mousePressed() {
+  // Handle button press states
+  if (startButton.isEnabled && mouseX >= startButton.x && mouseX <= startButton.x + startButton.w && 
+      mouseY >= startButton.y && mouseY <= startButton.y + startButton.h) {
+    startButton.isPressed = true;
+  }
+  
+  if (stopButton.isEnabled && mouseX >= stopButton.x && mouseX <= stopButton.x + stopButton.w && 
+      mouseY >= stopButton.y && mouseY <= stopButton.y + stopButton.h) {
+    stopButton.isPressed = true;
+  }
+  
+  if (downloadButton.isEnabled && mouseX >= downloadButton.x && mouseX <= downloadButton.x + downloadButton.w && 
+      mouseY >= downloadButton.y && mouseY <= downloadButton.y + downloadButton.h) {
+    downloadButton.isPressed = true;
+  }
+  
+  if (calibrateButton.isEnabled && mouseX >= calibrateButton.x && mouseX <= calibrateButton.x + calibrateButton.w && 
+      mouseY >= calibrateButton.y && mouseY <= calibrateButton.y + calibrateButton.h) {
+    calibrateButton.isPressed = true;
+  }
+}
+
+void mouseReleased() {
+  // Handle button clicks and release states
+  if (startButton.isPressed) {
+    startButton.wasClicked = true;
+    startButton.isPressed = false;
+  }
+  
+  if (stopButton.isPressed) {
+    stopButton.wasClicked = true;
+    stopButton.isPressed = false;
+  }
+  
+  if (downloadButton.isPressed) {
+    downloadButton.wasClicked = true;
+    downloadButton.isPressed = false;
+  }
+  
+  if (calibrateButton.isPressed) {
+    calibrateButton.wasClicked = true;
+    calibrateButton.isPressed = false;
+  }
+}
